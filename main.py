@@ -1,23 +1,18 @@
 """
-Telegram Feedback Bot + Flask keep-alive in ONE file
-- PostgreSQL (asyncpg) for logs
-- PTB v21 (async Application)
-- Flask endpoint for Render uptime
+Telegram Feedback Bot + Flask keep-alive (SQLite DB)
 """
 
 import os
 import logging
 import threading
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from flask import Flask, jsonify
-import asyncpg
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatType, ParseMode
+import aiosqlite
+from telegram import Update
 from telegram.ext import (
     Application, ApplicationBuilder, AIORateLimiter,
-    CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    CommandHandler, MessageHandler, ContextTypes, filters
 )
 
 # =====================
@@ -29,86 +24,90 @@ logger = logging.getLogger("feedback-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 REMINDER_INTERVAL_MINUTES = int(os.getenv("REMINDER_INTERVAL_MINUTES", "120"))
 
 # =====================
-# Database
+# Database (SQLite)
 # =====================
 class Database:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-        self.pool = None
+    def __init__(self, path="feedback.db"):
+        self.path = path
+        self.conn = None
 
     async def connect(self):
-        if self.pool is None:
-            self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
-            await self._create_tables()
+        self.conn = await aiosqlite.connect(self.path)
+        await self._create_tables()
 
     async def _create_tables(self):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS groups (
-                    group_id BIGINT PRIMARY KEY,
-                    group_name TEXT,
-                    date_added TIMESTAMPTZ DEFAULT NOW()
-                );
-                CREATE TABLE IF NOT EXISTS feedback_logs (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    username TEXT,
-                    display_name TEXT,
-                    group_id BIGINT NOT NULL,
-                    group_name TEXT,
-                    message_link TEXT,
-                    ts TIMESTAMPTZ DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback_logs(ts);
-                CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback_logs(user_id);
-                CREATE TABLE IF NOT EXISTS reminders (
-                    group_id BIGINT PRIMARY KEY,
-                    reminder_text TEXT NOT NULL,
-                    last_sent TIMESTAMPTZ
-                );
-            """)
+        await self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS groups (
+                group_id INTEGER PRIMARY KEY,
+                group_name TEXT,
+                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS feedback_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                display_name TEXT,
+                group_id INTEGER,
+                group_name TEXT,
+                message_link TEXT,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS reminders (
+                group_id INTEGER PRIMARY KEY,
+                reminder_text TEXT NOT NULL,
+                last_sent TIMESTAMP
+            );
+        """)
+        await self.conn.commit()
 
     async def add_group(self, gid, gname):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO groups (group_id, group_name)
-                VALUES ($1,$2)
-                ON CONFLICT (group_id) DO UPDATE SET group_name=EXCLUDED.group_name
-            """, gid, gname)
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO groups (group_id, group_name) VALUES (?, ?)",
+            (gid, gname)
+        )
+        await self.conn.commit()
 
     async def is_group_authorized(self, gid):
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval("SELECT 1 FROM groups WHERE group_id=$1", gid)
+        async with self.conn.execute("SELECT 1 FROM groups WHERE group_id=?", (gid,)) as cur:
+            return await cur.fetchone() is not None
 
-    async def log_feedback(self, user_id, username, display_name,
-                           gid, gname, msg_link):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO feedback_logs (user_id, username, display_name, group_id, group_name, message_link, ts)
-                VALUES ($1,$2,$3,$4,$5,$6,NOW())
-            """, user_id, username, display_name, gid, gname, msg_link)
+    async def log_feedback(self, user_id, username, display_name, gid, gname, msg_link):
+        await self.conn.execute("""
+            INSERT INTO feedback_logs (user_id, username, display_name, group_id, group_name, message_link)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, username, display_name, gid, gname, msg_link))
+        await self.conn.commit()
 
     async def feedback_in_last_days(self, gid, days):
-        async with self.pool.acquire() as conn:
-            return await conn.fetch("""
-                SELECT * FROM feedback_logs
-                WHERE group_id=$1 AND ts >= NOW() - ($2::INT || ' days')::INTERVAL
-                ORDER BY ts DESC
-            """, gid, days)
+        query = """
+            SELECT * FROM feedback_logs
+            WHERE group_id=? AND ts >= datetime('now', ?)
+            ORDER BY ts DESC
+        """
+        async with self.conn.execute(query, (gid, f'-{days} days')) as cur:
+            return await cur.fetchall()
 
     async def clear_feedback(self):
-        async with self.pool.acquire() as conn:
-            await conn.execute("DELETE FROM feedback_logs;")
+        await self.conn.execute("DELETE FROM feedback_logs")
+        await self.conn.commit()
 
-DB = Database(DATABASE_URL)
+    async def cleanup_old_feedback(self, days=5):
+        """Delete feedback older than X days"""
+        await self.conn.execute(
+            "DELETE FROM feedback_logs WHERE ts < datetime('now', ?)",
+            (f'-{days} days',)
+        )
+        await self.conn.commit()
+        logger.info(f"🧹 Old feedback older than {days} days deleted")
+
+DB = Database("feedback.db")
 
 # =====================
-# Bot Handlers
+# Helpers
 # =====================
 def make_link(chat, message_id):
     if chat.username:
@@ -118,11 +117,14 @@ def make_link(chat, message_id):
         cid = cid[4:]
     return f"https://t.me/c/{cid}/{message_id}"
 
+# =====================
+# Bot Handlers
+# =====================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Welcome to the HIJI's Private Bot")
 
 async def addgroup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or update.effective_user.id != OWNER_ID:
+    if update.effective_user.id != OWNER_ID:
         return await update.message.reply_text("❌ Only owner can authorize.")
     chat = update.effective_chat
     await DB.add_group(chat.id, chat.title or str(chat.id))
@@ -136,7 +138,7 @@ async def fb_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("No feedback in last 3 days.")
     msg = [f"📊 Feedback in last 3 days ({len(rows)} entries):"]
     for r in rows:
-        msg.append(f"- {r['display_name']} (@{r['username']}) → {r['message_link']}")
+        msg.append(f"- {r[3]} (@{r[2]}) → {r[6]}")
     await update.message.reply_text("\n".join(msg), disable_web_page_preview=True)
 
 async def cleardb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -196,6 +198,16 @@ def health():
 if __name__ == "__main__":
     async def run_bot():
         await DB.connect()
+        logger.info("✅ SQLite DB ready")
+
+        # Background auto-clean task
+        async def cleanup_task():
+            while True:
+                await DB.cleanup_old_feedback(5)  # delete >5 days old
+                await asyncio.sleep(24 * 60 * 60)  # run every 24h
+
+        asyncio.create_task(cleanup_task())
+
         bot_app = build_app()
         await bot_app.run_polling()
 
