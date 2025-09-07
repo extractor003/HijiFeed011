@@ -4,6 +4,7 @@ Gunicorn will serve this Flask app on $PORT. The bot runs alongside in a thread.
 """
 
 import threading
+import asyncio
 import os
 from flask import Flask, jsonify
 from bot import run_bot_polling
@@ -16,7 +17,13 @@ def _start_bot_once():
     global _bot_started
     with _lock:
         if not _bot_started:
-            t = threading.Thread(target=run_bot_polling, name="tg-bot-thread", daemon=True)
+            # Run the Telegram bot inside its own asyncio event loop
+            def runner():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(run_bot_polling())
+
+            t = threading.Thread(target=runner, name="tg-bot-thread", daemon=True)
             t.start()
             _bot_started = True
 
