@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Gunicorn serves the Flask app; bot starts in background thread
-CMD gunicorn -b 0.0.0.0:$PORT web:create_app()
+CMD gunicorn -b 0.0.0.0:$PORT web:create_app
