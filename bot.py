@@ -684,11 +684,11 @@ def build_application() -> Application:
     )
     return application
 
-def run_bot_polling():
+async def run_bot_polling():
     app = build_application()
-    # Run polling; keep the loop inside this thread
-    app.run_polling(close_loop=False)
+    await app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
-    # If you run bot.py directly, just start the bot
-    run_bot_polling()
+    import asyncio
+    asyncio.run(run_bot_polling())
