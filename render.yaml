@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: telegram-feedback-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -k gthread -b 0.0.0.0:$PORT 'web:create_app()'
+    envVars:
+      - key: BOT_TOKEN
+        sync: false  # set in Render dashboard
+      - key: REMINDER_INTERVAL_MINUTES
+        value: "120"
+      - key: HEARTBEAT_INTERVAL_SECONDS
+        value: "600"
+      - key: CLEANUP_INTERVAL_SECONDS
+        value: "3600"
