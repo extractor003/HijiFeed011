@@ -1,12 +1,16 @@
 services:
   - type: web
     name: telegram-feedback-bot
-    env: docker
+    env: python
     plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        sync: false   # set in Render dashboard
       - key: OWNER_ID
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: REMINDER_INTERVAL_MINUTES
+        value: "120"
