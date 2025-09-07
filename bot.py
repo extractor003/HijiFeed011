@@ -46,7 +46,8 @@ logger = logging.getLogger("feedback-bot")
 OWNER_ID = int(os.getenv("OWNER_ID"))  # HIJI's owner Telegram ID
 
 # HARD-CODED DB URL (user requested this). In production, prefer environment variables!
-DATABASE_URL = "postgresql://feedbackbotdb_user:CoFhI5lcBs6NMR3V6UCsekqCU7HxlGRW@dpg-d2uhndh5pdvs73ag4iog-a/feedbackbotdb"
+import os
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Bot token must still come from environment for safety
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
